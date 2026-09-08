@@ -10,6 +10,7 @@ text and returns structured JSON.
   cleaned up, and nothing is sent outside the machine.
 """
 
+import asyncio
 import os
 import tempfile
 
@@ -67,7 +68,8 @@ async def extract_pdf(file: UploadFile = File(...)):
         try:
             # Phase 8: scanned/image-only pages automatically fall back to the
             # local PaddleOCR engine; text pages still use PyMuPDF only.
-            result = extract_pdf_text(tmp_path, use_ocr=True)
+            # Run in worker thread so CPU OCR inference never freezes the event loop.
+            result = await asyncio.to_thread(extract_pdf_text, tmp_path, use_ocr=True)
         except PDFExtractionError as exc:
             logger.warning(f"PDF extraction failed for '{filename}': {exc}")
             raise HTTPException(

@@ -14,7 +14,13 @@ import fitz
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
-from app.services.ocr.service import OCRProcessingError, PADDLEOCR_AVAILABLE, ocr_service
+from app.services.ocr.service import (
+    OCRProcessingError,
+    OCRService,
+    OCRUnavailableError,
+    PADDLEOCR_AVAILABLE,
+    ocr_service,
+)
 from app.tools.pdf_tool import PDFExtractionError, extract_pdf_text
 
 requires_ocr = pytest.mark.skipif(
@@ -31,6 +37,17 @@ OCR_SAMPLE_LINES = [
     "Pump inspection status: NORMAL",
     "Bearing temperature: 42 C",
     "Calibration due: 2026-12-01",
+]
+
+
+INDUSTRIAL_INSPECTION_LINES = [
+    "CYBERNEX OCR TEST",
+    "Industrial Safety Inspection Report",
+    "Equipment: Pump-204",
+    "Pressure: 10 bar",
+    "Temperature: 85 C",
+    "Status: NORMAL",
+    "Inspector: Test User",
 ]
 
 
@@ -89,11 +106,6 @@ def _mixed_pdf_bytes():
     doc.close()
     return data
 
-
-def _write_pdf(tmp_path, name, data):
-    path = tmp_path / name
-    path.write_bytes(data)
-    return str(path)
 
 def _write_pdf(tmp_path, name, data):
     path = tmp_path / name
@@ -329,6 +341,32 @@ def test_api_pdf_extract_scanned_pdf(client):
     assert any(token in page["text"] for token in ("CYBERNEX", "OCR", "inspection", "NORMAL"))
 
 
+@requires_ocr
+def test_api_pdf_extract_scanned_multipage_returns_actual_text(client):
+    """POST /api/v1/pdf/extract returns actual page-level OCR text for each page in multi-page scan."""
+    page1_lines = ["CYBERNEX OCR PAGE ONE", "Equipment: Boiler-101"]
+    page2_lines = ["CYBERNEX OCR PAGE TWO", "Equipment: Turbine-202"]
+    data = _scanned_pdf_bytes([page1_lines, page2_lines])
+    res = _upload_pdf(client, "api_scanned_multi.pdf", data)
+    assert res.status_code == 200
+
+    body = res.json()
+    assert body["page_count"] == 2
+    assert len(body["pages"]) == 2
+
+    p1 = body["pages"][0]
+    assert p1["page_number"] == 1
+    assert p1["has_text"] is True
+    assert p1["character_count"] > 0
+    assert any(tok in p1["text"] for tok in ("ONE", "Boiler"))
+
+    p2 = body["pages"][1]
+    assert p2["page_number"] == 2
+    assert p2["has_text"] is True
+    assert p2["character_count"] > 0
+    assert any(tok in p2["text"] for tok in ("TWO", "Turbine"))
+
+
 def test_api_pdf_extract_rejects_non_pdf(client):
     res = _upload_pdf(client, "notes.txt", b"plain text, not a pdf")
     assert res.status_code == 400
@@ -364,3 +402,117 @@ def test_api_temp_upload_files_are_cleaned_up(client):
 
     after = set(glob.glob(pattern))
     assert after == before  # no temporary upload leaked on either path
+
+
+# ---------------------------------------------------------------------------
+# Reading Order & Synthetic Industrial Report Tests
+# ---------------------------------------------------------------------------
+
+
+def test_ocr_reading_order_sorting():
+    """Verify that _sort_reading_order groups lines and orders top-to-bottom, left-to-right."""
+    # Items: (text, conf, (xmin, ymin, xmax, ymax))
+    items = [
+        ("Line 2 Col 2", 0.95, (200.0, 100.0, 350.0, 120.0)),
+        ("Line 1 Col 2", 0.95, (200.0, 30.0, 350.0, 50.0)),
+        ("Line 2 Col 1", 0.95, (50.0, 102.0, 180.0, 122.0)),
+        ("Line 1 Col 1", 0.95, (50.0, 32.0, 180.0, 52.0)),
+    ]
+    texts, scores = OCRService._sort_reading_order(items)
+    assert texts == ["Line 1 Col 1", "Line 1 Col 2", "Line 2 Col 1", "Line 2 Col 2"]
+
+
+@requires_ocr
+def test_extract_scanned_synthetic_industrial_report(tmp_path):
+    """Verify PaddleOCR recovers exact industrial safety report fields from a scanned PDF."""
+    pdf_bytes = _scanned_pdf_bytes([INDUSTRIAL_INSPECTION_LINES])
+    path = _write_pdf(tmp_path, "synthetic_inspection.pdf", pdf_bytes)
+
+    result = extract_pdf_text(path, use_ocr=True)
+    assert result["page_count"] == 1
+    page = result["pages"][0]
+    assert page["page_number"] == 1
+    assert page["has_text"] is True
+    assert page["source"] == "ocr"
+
+    page_text = page["text"]
+    assert "CYBERNEX" in page_text
+    assert "Inspection" in page_text
+    assert "Pump-204" in page_text or "Pump" in page_text
+    assert "NORMAL" in page_text
+    assert "10 bar" in page_text or "bar" in page_text
+    assert "85 C" in page_text or "85" in page_text
+    assert "Test User" in page_text or "User" in page_text
+
+
+@requires_ocr
+def test_ocr_service_extract_text_preserves_page_headings_and_content(tmp_path):
+    """Verify ocr_service.extract_text outputs non-empty page headers for scanned documents."""
+    pdf_bytes = _scanned_pdf_bytes([INDUSTRIAL_INSPECTION_LINES])
+    path = _write_pdf(tmp_path, "inspection_service.pdf", pdf_bytes)
+
+    res = ocr_service.extract_text(path)
+    assert res["pages"] == 1
+    assert "PyMuPDF + PaddleOCR" in res["engine"]
+    full_text = res["text"]
+    assert "--- Page 1 ---" in full_text
+    assert any(tok in full_text for tok in ("NORMAL", "Pump", "Inspection", "CYBERNEX"))
+
+
+@requires_ocr
+def test_agent_pipeline_end_to_end_scanned_pdf_generates_docx(tmp_path):
+    """End-to-end integration test: Scanned PDF -> Agent Graph -> DOCX output with actual OCR text."""
+    import docx
+    import zipfile
+    from app.services.agent.graph import agent_graph, AgentState
+
+    pdf_bytes = _scanned_pdf_bytes([INDUSTRIAL_INSPECTION_LINES])
+    pdf_path = _write_pdf(tmp_path, "industrial_report.pdf", pdf_bytes)
+
+    initial_state: AgentState = {
+        "task_id": "test-ocr-task",
+        "run_id": "test-run-ocr",
+        "prompt": "Extract all text from the attached scanned PDF page by page. Return the OCR-extracted text for each page separately. Do not summarize the document.",
+        "selected_model": "Auto",
+        "selected_tools": ["OCR", "Documents"],
+        "files": [
+            {
+                "file_type": "PDF",
+                "original_name": "industrial_report.pdf",
+                "file_path": pdf_path,
+            }
+        ],
+        "task_understanding": "",
+        "plan_steps": [],
+        "model_routed": "Auto",
+        "retrieved_chunks": [],
+        "ocr_text": "",
+        "execution_result": "",
+        "verification_status": "Pending",
+        "deliverable": None,
+        "current_step": 0,
+        "step_events": [],
+    }
+
+    final_state = agent_graph.invoke(initial_state)
+
+    deliv = final_state.get("deliverable")
+    assert deliv is not None
+    assert deliv["type"] == "DOCX"
+    docx_path = deliv["file_path"]
+    assert os.path.exists(docx_path)
+
+    # 1. Structural validation: must be a valid ZIP archive
+    assert zipfile.is_zipfile(docx_path)
+
+    # 2. Content validation: open via python-docx and inspect paragraphs
+    doc = docx.Document(docx_path)
+    all_paras = [p.text for p in doc.paragraphs]
+    combined_text = "\n".join(all_paras)
+
+    # Filename and page heading must be present
+    assert any("industrial_report.pdf" in p for p in all_paras)
+    assert any("--- Page 1 ---" in p for p in all_paras)
+
+    # The actual OCR text must be present, NOT empty page headings
+    assert any(tok in combined_text for tok in ("NORMAL", "Pump", "Inspection", "CYBERNEX"))

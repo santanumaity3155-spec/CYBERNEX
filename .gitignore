@@ -44,3 +44,12 @@ backend/storage/*.db
 !backend/storage/uploads/.gitkeep
 !backend/storage/outputs/.gitkeep
 !backend/storage/documents/.gitkeep
+
+# Root runtime storage
+storage/uploads/*
+storage/outputs/*
+storage/*.db
+
+# Preserve directory placeholders
+!storage/uploads/.gitkeep
+!storage/outputs/.gitkeep

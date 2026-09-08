@@ -100,12 +100,17 @@ class DocumentGenerator:
                     h.runs[0].font.color.rgb = RGBColor(3, 105, 161)
 
                 if sec_content:
-                    paragraphs = sec_content.split("\n\n")
-                    for p_text in paragraphs:
-                        clean_p = p_text.strip()
-                        if clean_p:
-                            p = doc.add_paragraph(clean_p)
-                            p.style.font.size = Pt(11)
+                    blocks = sec_content.split("\n\n")
+                    for b in blocks:
+                        clean_b = b.strip()
+                        if not clean_b:
+                            continue
+                        lines = clean_b.split("\n")
+                        for line in lines:
+                            clean_line = line.strip()
+                            if clean_line:
+                                p = doc.add_paragraph(clean_line)
+                                p.style.font.size = Pt(11)
                 else:
                     p = doc.add_paragraph("")
                     p.style.font.size = Pt(11)

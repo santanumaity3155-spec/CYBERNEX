@@ -23,6 +23,7 @@ Supported engine versions:
 """
 
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -43,6 +44,23 @@ except Exception:  # pragma: no cover - depends on environment
 
 # Reasonable CPU-friendly resolution for OCR page rendering (dots per inch).
 OCR_RENDER_DPI = 200
+
+
+def _find_venv_python() -> Optional[str]:
+    """Find a Python interpreter in the local backend virtual environment."""
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(5):
+        candidate_win = os.path.join(cur_dir, ".venv", "Scripts", "python.exe")
+        candidate_posix = os.path.join(cur_dir, ".venv", "bin", "python")
+        if os.path.isfile(candidate_win):
+            return candidate_win
+        if os.path.isfile(candidate_posix):
+            return candidate_posix
+        parent = os.path.dirname(cur_dir)
+        if parent == cur_dir:
+            break
+        cur_dir = parent
+    return None
 
 
 class OCRUnavailableError(RuntimeError):
@@ -71,7 +89,14 @@ class OCRService:
     @property
     def is_available(self) -> bool:
         """True when a local PaddleOCR engine can be (and was) initialized."""
-        return self._get_paddle_ocr() is not None
+        if self._get_paddle_ocr() is not None:
+            return True
+        # If in-process is unavailable (e.g. running under Python 3.14),
+        # check if .venv Python has PaddleOCR available for subprocess execution.
+        if not PADDLEOCR_AVAILABLE:
+            venv_py = _find_venv_python()
+            return venv_py is not None and os.path.isfile(venv_py)
+        return False
 
     def _engine_kwargs(self) -> Dict[str, Any]:
         """Kwargs used to construct PaddleOCR, adapted to the installed API.
@@ -80,6 +105,13 @@ class OCRService:
         the oneDNN backend hits an upstream 'ConvertPirAttribute2RuntimeAttribute'
         crash while running the PP-OCRv6 inference programs, so we force the
         plain 'paddle' run mode (still fully local, just CPU-only).
+
+        We also cap text detection max side length to 960 to ensure predictable,
+        high-speed CPU inference without compromising document text recognition.
+
+        For CPU-bound inference, PP-OCRv4 mobile models are used instead of the
+        heavier PP-OCRv6 medium defaults: they deliver comparable recognition
+        accuracy on industrial documents while running ~2-3x faster on CPU.
         """
         if _PADDLEOCR_MAJOR >= 3:
             return {
@@ -87,7 +119,11 @@ class OCRService:
                 "use_doc_unwarping": False,
                 "use_textline_orientation": False,
                 "lang": "en",
+                "ocr_version": "PP-OCRv4",
                 "enable_mkldnn": False,
+                "text_det_limit_side_len": 960,
+                "text_det_limit_type": "max",
+                "text_det_box_thresh": 0.7,
             }
         # PaddleOCR 2.x API
         return {"use_angle_cls": True, "lang": "en", "show_log": False}
@@ -97,17 +133,30 @@ class OCRService:
         try:
             return PaddleOCR(**kwargs)
         except (TypeError, ValueError) as exc:
-            # Older 3.x releases may not know 'enable_mkldnn'; retry minimal.
+            # Older 3.x releases may not know 'enable_mkldnn' or tuning kwargs; retry.
             if _PADDLEOCR_MAJOR >= 3:
                 logger.warning(
                     "PaddleOCR init with tuned kwargs failed (%s); retrying minimal config.", exc
                 )
-                return PaddleOCR(
-                    use_doc_orientation_classify=False,
-                    use_doc_unwarping=False,
-                    use_textline_orientation=False,
-                    lang="en",
-                )
+                try:
+                    return PaddleOCR(
+                        use_doc_orientation_classify=False,
+                        use_doc_unwarping=False,
+                        use_textline_orientation=False,
+                        lang="en",
+                        ocr_version="PP-OCRv4",
+                        text_det_limit_side_len=960,
+                        text_det_limit_type="max",
+                        text_det_box_thresh=0.7,
+                    )
+                except (TypeError, ValueError):
+                    return PaddleOCR(
+                        use_doc_orientation_classify=False,
+                        use_doc_unwarping=False,
+                        use_textline_orientation=False,
+                        lang="en",
+                        ocr_version="PP-OCRv4",
+                    )
             raise
 
     def _get_paddle_ocr(self) -> Any:
@@ -115,7 +164,7 @@ class OCRService:
         if self._ocr_engine is not None:
             return self._ocr_engine
         if not PADDLEOCR_AVAILABLE:
-            logger.warning("PaddleOCR is not installed; local OCR is unavailable.")
+            logger.warning("PaddleOCR is not installed in current process; will check .venv worker.")
             return None
         try:
             self._ocr_engine = self._new_engine()
@@ -126,61 +175,137 @@ class OCRService:
         return self._ocr_engine
 
     # ------------------------------------------------------------------
-    # Result parsing
+    # Result parsing & reading order sorting
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sort_reading_order(
+        items: List[Tuple[str, float, Optional[Tuple[float, float, float, float]]]]
+    ) -> Tuple[List[str], List[float]]:
+        """Sort detected text lines in natural reading order (top-to-bottom, left-to-right).
+
+        Grouping lines vertically based on median line height prevents
+        slight detection slant or column ordering from shuffling the text.
+        """
+        if not items:
+            return [], []
+
+        # If no bounding boxes are available, retain original detection order
+        if not any(item[2] is not None for item in items):
+            return [it[0] for it in items], [it[1] for it in items]
+
+        # Calculate median line height to cluster lines into vertical reading bands
+        heights = [
+            (box[3] - box[1])
+            for _, _, box in items
+            if box is not None and (box[3] - box[1]) > 0
+        ]
+        line_height = float(np.median(heights)) if heights else 20.0
+        line_tolerance = max(line_height * 0.5, 8.0)
+
+        # Primary sort: vertical line bucket (ymin / line_tolerance)
+        # Secondary sort: horizontal position (xmin)
+        def line_key(
+            item: Tuple[str, float, Optional[Tuple[float, float, float, float]]]
+        ) -> Tuple[int, float]:
+            box = item[2]
+            if box is None:
+                return (0, 0.0)
+            xmin, ymin, _, _ = box
+            line_bucket = int(round(ymin / line_tolerance))
+            return (line_bucket, xmin)
+
+        sorted_items = sorted(items, key=line_key)
+        return [it[0] for it in sorted_items], [it[1] for it in sorted_items]
 
     def _extract_v3(self, results: Any) -> Tuple[List[str], List[float]]:
         """Parse PaddleOCR 3.x ``predict`` output (dict-like OCRResult objects)."""
-        lines: List[str] = []
-        scores: List[float] = []
+        raw_items: List[Tuple[str, float, Optional[Tuple[float, float, float, float]]]] = []
         for res in results:
             if res is None:
                 continue
-            texts = None
-            score_vals = None
+
+            texts: List[str] = []
+            scores: List[float] = []
+            boxes_data = None
+
             if hasattr(res, "get"):
-                if "rec_texts" in res:
-                    texts = res["rec_texts"]
-                    score_vals = res.get("rec_scores")
-                elif "text" in res:
+                texts = res.get("rec_texts") or []
+                scores = res.get("rec_scores") or []
+                boxes_data = res.get("rec_boxes")
+                if boxes_data is None:
+                    boxes_data = res.get("dt_polys") or res.get("rec_polys")
+                if not texts and "text" in res:
                     texts = res["text"]
-            if texts is None and hasattr(res, "text"):
-                texts = res.text
+            elif hasattr(res, "rec_texts"):
+                texts = getattr(res, "rec_texts", [])
+                scores = getattr(res, "rec_scores", [])
+                boxes_data = getattr(res, "rec_boxes", None)
+
             if isinstance(texts, str):
                 texts = [texts]
-            if isinstance(score_vals, (int, float)):
-                score_vals = [score_vals]
-            for index, item in enumerate(texts or []):
-                if isinstance(item, str) and item.strip():
-                    lines.append(item.strip())
-                    if isinstance(score_vals, (list, tuple)) and index < len(score_vals):
-                        try:
-                            scores.append(float(score_vals[index]))
-                        except (TypeError, ValueError):
-                            pass
-        return lines, scores
+            if isinstance(scores, (int, float)):
+                scores = [scores]
+
+            for idx, item in enumerate(texts or []):
+                if not isinstance(item, str) or not item.strip():
+                    continue
+                conf = 0.95
+                if isinstance(scores, (list, tuple)) and idx < len(scores):
+                    try:
+                        conf = float(scores[idx])
+                    except (TypeError, ValueError):
+                        pass
+
+                box_tuple = None
+                if boxes_data is not None and idx < len(boxes_data):
+                    try:
+                        b = boxes_data[idx]
+                        if hasattr(b, "tolist"):
+                            b = b.tolist()
+                        if len(b) == 4 and isinstance(b[0], (int, float)):
+                            box_tuple = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+                        elif len(b) == 4 and isinstance(b[0], (list, tuple)):
+                            xs = [pt[0] for pt in b]
+                            ys = [pt[1] for pt in b]
+                            box_tuple = (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys)))
+                    except Exception:
+                        box_tuple = None
+
+                raw_items.append((item.strip(), conf, box_tuple))
+
+        return self._sort_reading_order(raw_items)
 
     def _extract_v2(self, result: Any) -> Tuple[List[str], List[float]]:
         """Parse PaddleOCR 2.x ``ocr`` output: [[[box, (text, conf)], ...], ...]."""
-        lines: List[str] = []
-        scores: List[float] = []
+        raw_items: List[Tuple[str, float, Optional[Tuple[float, float, float, float]]]] = []
         if not result:
-            return lines, scores
+            return [], []
         first = result[0] if isinstance(result, list) else result
         if not first:
-            return lines, scores
+            return [], []
         for item in first:
             try:
+                poly = item[0]
                 text, conf = item[1]
             except (IndexError, TypeError, ValueError):
                 continue
-            if isinstance(text, str) and text.strip():
-                lines.append(text.strip())
-                try:
-                    scores.append(float(conf))
-                except (TypeError, ValueError):
-                    pass
-        return lines, scores
+            if not isinstance(text, str) or not text.strip():
+                continue
+            box_tuple = None
+            try:
+                if poly and len(poly) == 4:
+                    xs = [pt[0] for pt in poly]
+                    ys = [pt[1] for pt in poly]
+                    box_tuple = (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys)))
+            except Exception:
+                pass
+            try:
+                score = float(conf)
+            except (TypeError, ValueError):
+                score = 0.95
+            raw_items.append((text.strip(), score, box_tuple))
+        return self._sort_reading_order(raw_items)
 
     # ------------------------------------------------------------------
     # Core recognition
@@ -213,29 +338,119 @@ class OCRService:
             return arr
         raise OCRProcessingError("Unsupported image input type for OCR.")
 
-    def _text_and_score(self, image: Any) -> Tuple[str, Optional[float]]:
-        """Run OCR on an in-memory image; returns (joined_text, mean_confidence)."""
-        arr = self._decode_image(image)
-        engine = self._get_paddle_ocr()
-        if engine is None:
+    def _run_via_venv(self, image: Any) -> Tuple[str, Optional[float]]:
+        """Run OCR via worker process in backend/.venv when current python lacks PaddleOCR."""
+        venv_py = _find_venv_python()
+        if not venv_py or not os.path.isfile(venv_py):
             raise OCRUnavailableError("Local OCR engine (PaddleOCR) is unavailable.")
 
+        if isinstance(image, (bytes, bytearray, memoryview)):
+            image_bytes = bytes(image)
+        elif isinstance(image, np.ndarray):
+            success, encoded = cv2.imencode(".png", image)
+            if not success:
+                raise OCRProcessingError("Failed to encode image array for OCR.")
+            image_bytes = encoded.tobytes()
+        elif isinstance(image, str) and os.path.isfile(image):
+            with open(image, "rb") as f:
+                image_bytes = f.read()
+        else:
+            raise OCRProcessingError("Unsupported image input format for OCR.")
+
+        worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker.py")
+        backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+        import subprocess
+        import json
+
         try:
-            if self._paddle_api_major >= 3:
-                results = engine.predict(arr)
-                lines, scores = self._extract_v3(results)
+            proc = subprocess.run(
+                [venv_py, worker_script],
+                input=image_bytes,
+                capture_output=True,
+                cwd=backend_dir,
+                timeout=120,
+            )
+            if proc.returncode != 0:
+                logger.error(f"OCR worker subprocess failed: {proc.stderr.decode('utf-8', errors='ignore')}")
+                raise OCRProcessingError("OCR inference failed in worker process.")
+
+            stdout_str = proc.stdout.decode("utf-8", errors="ignore")
+            if "__CYBERNEX_JSON_START__" in stdout_str and "__CYBERNEX_JSON_END__" in stdout_str:
+                json_chunk = stdout_str.split("__CYBERNEX_JSON_START__", 1)[1].split("__CYBERNEX_JSON_END__", 1)[0].strip()
+                out_data = json.loads(json_chunk)
             else:
-                result = engine.ocr(arr, cls=True)
-                lines, scores = self._extract_v2(result)
-        except OCRUnavailableError:
+                out_data = json.loads(stdout_str.strip())
+
+            if not out_data.get("success", False):
+                err = out_data.get("error", "Unknown error")
+                logger.error(f"OCR worker returned error: {err}")
+                raise OCRProcessingError(f"OCR inference failed: {err}")
+
+            return out_data.get("text", ""), out_data.get("score")
+        except subprocess.TimeoutExpired as exc:
+            logger.error("OCR worker timed out.")
+            raise OCRProcessingError("OCR inference timed out.") from exc
+        except (OCRUnavailableError, OCRProcessingError):
             raise
         except Exception as exc:
-            logger.error(f"PaddleOCR inference failed: {type(exc).__name__}")
-            raise OCRProcessingError("OCR inference failed on the provided image.") from exc
+            logger.error(f"OCR worker execution error: {type(exc).__name__}: {exc}")
+            raise OCRProcessingError("OCR inference worker error.") from exc
 
-        text = "\n".join(lines)
-        mean_score = float(np.mean(scores)) if scores else None
-        return text, mean_score
+    def _text_and_score(self, image: Any) -> Tuple[str, Optional[float]]:
+        """Run OCR on an in-memory image; returns (joined_text, mean_confidence)."""
+        engine = self._get_paddle_ocr()
+        if engine is not None:
+            arr = self._decode_image(image)
+            try:
+                if self._paddle_api_major >= 3:
+                    logger.info(
+                        f"Starting PaddleOCR predict on image array shape={arr.shape}, dtype={arr.dtype}..."
+                    )
+                    t_start = time.perf_counter()
+                    results = engine.predict(arr)
+                    duration = time.perf_counter() - t_start
+                    num_results = len(results) if isinstance(results, (list, tuple)) else 1
+                    res_type = type(results).__name__
+                    logger.info(
+                        f"PaddleOCR predict completed in {duration:.2f}s: "
+                        f"returned {num_results} result item(s) of type {res_type}."
+                    )
+                    t_start = time.perf_counter()
+                    lines, scores = self._extract_v3(results)
+                    parse_duration = time.perf_counter() - t_start
+                    logger.info(
+                        f"Extracted {len(lines)} OCR text line(s) in reading order in {parse_duration:.2f}s."
+                    )
+                else:
+                    logger.info(
+                        f"Starting PaddleOCR v2 ocr on image array shape={arr.shape}, dtype={arr.dtype}..."
+                    )
+                    t_start = time.perf_counter()
+                    result = engine.ocr(arr, cls=True)
+                    duration = time.perf_counter() - t_start
+                    logger.info(f"PaddleOCR v2 ocr completed in {duration:.2f}s.")
+                    t_start = time.perf_counter()
+                    lines, scores = self._extract_v2(result)
+                    parse_duration = time.perf_counter() - t_start
+                    logger.info(
+                        f"Extracted {len(lines)} OCR text line(s) in reading order in {parse_duration:.2f}s."
+                    )
+            except OCRUnavailableError:
+                raise
+            except Exception as exc:
+                logger.error(f"PaddleOCR inference failed: {type(exc).__name__}: {exc}")
+                raise OCRProcessingError("OCR inference failed on the provided image.") from exc
+
+            text = "\n".join(lines)
+            mean_score = float(np.mean(scores)) if scores else None
+            return text, mean_score
+
+        # Fallback to .venv worker if available
+        if not PADDLEOCR_AVAILABLE and self.is_available:
+            return self._run_via_venv(image)
+
+        raise OCRUnavailableError("Local OCR engine (PaddleOCR) is unavailable.")
 
     def ocr_image(self, image: Any) -> str:
         """Extract text from an image (PNG bytes or ndarray), fully local.
@@ -302,84 +517,40 @@ class OCRService:
             logger.error(f"Text read failed for '{file_path}': {type(exc).__name__}")
             return {"text": "", "pages": 0, "confidence": 0.0, "engine": "Error"}
 
-    def _extract_pdf(self, file_path: str, min_density_chars: int) -> Dict[str, Any]:
+    def _extract_pdf(self, file_path: str, min_density_chars: int = 50) -> Dict[str, Any]:
         """PyMuPDF-first, page-aware OCR fallback for PDF files."""
-        # Deferred import avoids a circular dependency (pdf_tool imports this service).
-        from app.tools.pdf_tool import clean_page_text
+        from app.tools.pdf_tool import extract_pdf_text, PDFExtractionError
 
         filename = os.path.basename(file_path)
         try:
-            with open(file_path, "rb") as handle:
-                pdf_bytes = handle.read()
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            result = extract_pdf_text(file_path, use_ocr=True)
+        except PDFExtractionError as exc:
+            logger.error(f"Failed to extract PDF '{filename}' for OCR: {exc}")
+            raise
         except Exception as exc:
-            logger.error(f"Failed to open PDF '{filename}' for OCR: {type(exc).__name__}")
+            logger.error(f"Failed to process PDF '{filename}' for OCR: {exc}")
             return {"text": "", "pages": 0, "confidence": 0.0, "engine": "Error"}
 
-        try:
-            if doc.needs_pass:
-                logger.warning(f"PDF '{filename}' is password protected; OCR skipped.")
-                return {"text": "", "pages": len(doc), "confidence": 0.0, "engine": "Error"}
-
-            zoom = OCR_RENDER_DPI / 72.0
-            matrix = fitz.Matrix(zoom, zoom)
-
-            parts: List[str] = []
-            ocr_used = False
-            engine_unavailable = not self.is_available
-            score_values: List[float] = []
-
-            for index, page in enumerate(doc):
-                page_number = index + 1
-                extracted = clean_page_text(page.get_text("text"))
-                if len(extracted) >= min_density_chars:
-                    parts.append(f"--- Page {page_number} ---\n{extracted}")
-                    continue
-
-                # Page has little/no meaningful text -> needs OCR.
-                if engine_unavailable:
-                    parts.append(f"--- Page {page_number} ---\n")
-                    continue
-
-                try:
-                    pix = page.get_pixmap(matrix=matrix, alpha=False)
-                    ocr_text, mean_score = self._text_and_score(pix.tobytes("png"))
-                except Exception as exc:
-                    logger.error(
-                        f"OCR failed for page {page_number} of '{filename}': {type(exc).__name__}"
-                    )
-                    parts.append(f"--- Page {page_number} ---\n")
-                    continue
-
-                if mean_score is not None:
-                    score_values.append(mean_score)
-                if ocr_text.strip():
-                    ocr_used = True
-                    parts.append(f"--- Page {page_number} ---\n{ocr_text}")
-                else:
-                    parts.append(f"--- Page {page_number} ---\n")
-
-            full_text = "\n\n".join(parts).strip()
-            if engine_unavailable:
-                engine = "OCR_UNAVAILABLE"
-            elif ocr_used:
-                engine = "PyMuPDF + PaddleOCR"
+        parts: List[str] = []
+        ocr_used = False
+        for p in result.get("pages", []):
+            p_num = p.get("page_number")
+            p_text = p.get("text", "")
+            if p.get("source") == "ocr" and p.get("has_text"):
+                ocr_used = True
+            if p_text.strip():
+                parts.append(f"--- Page {p_num} ---\n{p_text}")
             else:
-                engine = "PyMuPDF"
+                parts.append(f"--- Page {p_num} ---\n")
 
-            if score_values:
-                confidence = round(float(np.mean(score_values)), 4)
-            else:
-                confidence = 0.95 if full_text else 0.0
-
-            return {
-                "text": full_text,
-                "pages": len(doc),
-                "confidence": confidence,
-                "engine": engine,
-            }
-        finally:
-            doc.close()
+        full_text = "\n\n".join(parts).strip()
+        engine = "PyMuPDF + PaddleOCR" if ocr_used else "PyMuPDF"
+        return {
+            "text": full_text,
+            "pages": result.get("page_count", 0),
+            "confidence": 0.95 if full_text else 0.0,
+            "engine": engine,
+        }
 
 
 # Process-wide singleton so the PaddleOCR engine (model weights) is loaded once

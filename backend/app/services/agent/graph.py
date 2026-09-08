@@ -134,9 +134,13 @@ def execute_node(state: AgentState) -> AgentState:
         file_path = f.get("file_path")
         if file_path and os.path.exists(file_path):
             res = ocr_service.extract_text(file_path)
-            extracted_text += f"\n--- {f.get('original_name')} ---\n" + res.get("text", "")
+            content = res.get("text", "").strip()
+            if content:
+                extracted_text += f"\n--- {f.get('original_name')} ---\n\n" + content + "\n"
+            else:
+                extracted_text += f"\n--- {f.get('original_name')} ---\n"
 
-    state["ocr_text"] = extracted_text
+    state["ocr_text"] = extracted_text.strip()
 
     # Vector RAG search
     retrieved_chunks = []
@@ -198,11 +202,35 @@ def generate_output_node(state: AgentState) -> AgentState:
     chunks = state.get("retrieved_chunks", [])
     ocr_text = state.get("ocr_text", "")
 
-    sections = [
-        {"title": "1. Executive Summary", "content": f"Task Prompt: {prompt}\n\nProcessed task context locally with zero cloud dependencies."},
-        {"title": "2. Extracted Evidence & Context", "content": ocr_text if ocr_text else "No uploaded attachment text."},
-        {"title": "3. Vector Knowledge References", "content": "\n\n".join([c.get("text", "") for c in chunks]) if chunks else "No vector chunks retrieved."}
-    ]
+    # For text extraction requests, format document to prioritize the raw extracted text
+    is_extraction_request = any(
+        kw in prompt.lower() for kw in [
+            "extract all text", "page by page", "ocr-extracted", "ocr text", "do not summarize", "extract text"
+        ]
+    )
+
+    if is_extraction_request and ocr_text:
+        sections = [
+            {
+                "title": "1. Extraction Overview",
+                "content": f"Task Prompt: {prompt}\n\nAll document text was extracted page by page locally using on-premise OCR. Zero external APIs, zero cloud transmission."
+            },
+            {
+                "title": "2. Extracted Document Content",
+                "content": ocr_text
+            }
+        ]
+        if chunks:
+            sections.append({
+                "title": "3. Vector Knowledge References",
+                "content": "\n\n".join([c.get("text", "") for c in chunks])
+            })
+    else:
+        sections = [
+            {"title": "1. Executive Summary", "content": f"Task Prompt: {prompt}\n\nProcessed task context locally with zero cloud dependencies."},
+            {"title": "2. Extracted Evidence & Context", "content": ocr_text if ocr_text else "No uploaded attachment text."},
+            {"title": "3. Vector Knowledge References", "content": "\n\n".join([c.get("text", "") for c in chunks]) if chunks else "No vector chunks retrieved."}
+        ]
 
     out = doc_generator.generate_docx(
         title=f"Analysis Report - {prompt[:30]}",

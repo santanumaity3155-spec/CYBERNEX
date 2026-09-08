@@ -45,6 +45,7 @@ The per-page ``source`` field is metadata: "pymupdf" (native text layer),
 public API response schema.
 """
 
+import concurrent.futures
 import os
 import time
 from typing import Any, Dict, List
@@ -59,6 +60,9 @@ SOURCE_OCR = "ocr"
 # Pages render at 200 DPI for OCR: high enough for clear text recognition,
 # small enough to keep images memory-friendly.
 OCR_RENDER_DPI = 200
+
+# Per-page OCR timeout to prevent a single complex page from stalling requests.
+PAGE_OCR_TIMEOUT_SECONDS = 60.0
 
 
 class PDFExtractionError(Exception):
@@ -142,19 +146,50 @@ def _extract_page_text_via_ocr(page: Any, page_number: int, dpi: int) -> str:
         )
 
     try:
+        logger.info(f"Rendering PDF page {page_number} for OCR (DPI={dpi})...")
+        t_render = time.perf_counter()
         image_bytes = _render_page_to_png_bytes(page, dpi)
-        raw_text = ocr_service.ocr_image_bytes(image_bytes)
+        render_duration = time.perf_counter() - t_render
+
+        try:
+            pt_w = getattr(page.rect, "width", 595.0)
+            pt_h = getattr(page.rect, "height", 842.0)
+            w_px = int(round(pt_w * dpi / 72.0))
+            h_px = int(round(pt_h * dpi / 72.0))
+        except Exception:
+            w_px, h_px = 0, 0
+
+        logger.info(
+            f"Page {page_number} rendered image dimensions: {w_px}x{h_px} "
+            f"({len(image_bytes)} bytes, {render_duration:.2f}s)."
+        )
+
+        t_ocr = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(ocr_service.ocr_image_bytes, image_bytes)
+            try:
+                raw_text = future.result(timeout=PAGE_OCR_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError as exc:
+                logger.error(
+                    f"OCR inference timed out after {PAGE_OCR_TIMEOUT_SECONDS}s on page {page_number}."
+                )
+                raise OCRProcessingError(
+                    f"OCR inference timed out after {PAGE_OCR_TIMEOUT_SECONDS}s on page {page_number}."
+                ) from exc
+
+        ocr_duration = time.perf_counter() - t_ocr
+        logger.info(f"OCR inference finished for page {page_number} in {ocr_duration:.2f}s.")
     except OCRUnavailableError as exc:
         raise PDFExtractionError(
             "OCR is required for this PDF, but the local OCR engine (PaddleOCR) "
             "is unavailable."
         ) from exc
     except OCRProcessingError as exc:
-        logger.error(f"OCR processing failed for page {page_number}.")
+        logger.error(f"OCR processing failed for page {page_number}: {exc}")
         raise PDFExtractionError("OCR processing failed for this PDF.") from exc
     except Exception as exc:
         logger.error(
-            f"Page rendering or OCR failed for page {page_number}: {type(exc).__name__}"
+            f"Page rendering or OCR failed for page {page_number}: {type(exc).__name__}: {exc}"
         )
         raise PDFExtractionError("A PDF page could not be processed for OCR.") from exc
 
